@@ -1031,7 +1031,6 @@ class ArgoWorkflows(object):
         self.conditional_join_nodes = set()
         self.matching_conditional_join_dict = {}
         self.recursive_nodes = set()
-        self.wrapped_conditional_nodes = set()
 
         node_conditional_parents = {}
         node_conditional_branches = {}
@@ -1245,6 +1244,25 @@ class ArgoWorkflows(object):
     def _is_recursive_node(self, node):
         return node.name in self.recursive_nodes
 
+    def _conditional_control_parameters(self, node):
+        parameters = []
+        for in_func in node.in_funcs:
+            predecessor = self.graph[in_func]
+            sanitized = self._sanitize(in_func)
+            if predecessor.type == "split-switch":
+                parameters.append(
+                    Parameter("switch-step-value-%s" % sanitized).value(
+                        "{{tasks.%s.outputs.parameters.switch-step}}" % sanitized
+                    )
+                )
+            if self._is_conditional_node(predecessor) and predecessor.type != "foreach":
+                parameters.append(
+                    Parameter("should-run-%s" % sanitized).value(
+                        "{{tasks.%s.outputs.parameters.should-run}}" % sanitized
+                    )
+                )
+        return parameters
+
     def _matching_conditional_join(self, node):
         # If no earlier conditional join step is found during parsing,
         # fall back to the graph's terminal step.
@@ -1253,10 +1271,9 @@ class ArgoWorkflows(object):
     def _build_conditional_wrapper(self, node, dag_task_parameters):
         """Build a Steps wrapper template for a conditional node.
 
-        The wrapper always runs and always produces outputs (task-id, should-run).
-        The inner step uses a `when` clause to conditionally skip execution.
-        This ensures that task-id references from downstream steps always resolve,
-        even when the conditional branch is not taken.
+        The wrapper produces stable outputs when the logical node succeeds or is
+        inactive. If selected execution fails, the wrapper fails and downstream
+        dependencies prevent consumers from resolving its missing outputs.
         """
         sanitized = self._sanitize(node.name)
         inner_template = self._sanitize("cond-%s" % node.name)
@@ -1270,7 +1287,7 @@ class ArgoWorkflows(object):
             in_func
             for in_func in node.in_funcs
             if self._is_conditional_node(self.graph[in_func])
-            and self.graph[in_func].type not in ("foreach",)
+            and self.graph[in_func].type != "foreach"
         ]
 
         # Build wrapper input declarations and inner step arguments.
@@ -1319,13 +1336,6 @@ class ArgoWorkflows(object):
             inner_step.when(inner_when)
 
         wrapper_outputs = [
-            Parameter("task-id").valueFrom(
-                {
-                    "expression": "steps['inner']?.status == 'Succeeded'"
-                    " ? steps['inner'].outputs.parameters['task-id']"
-                    " : 'SKIPPED'"
-                }
-            ),
             Parameter("should-run").valueFrom(
                 {
                     "expression": "steps['inner']?.status == 'Succeeded'"
@@ -1333,6 +1343,17 @@ class ArgoWorkflows(object):
                 }
             ),
         ]
+        if not node.parallel_step and node.name != self.graph.end_step:
+            wrapper_outputs.insert(
+                0,
+                Parameter("task-id").valueFrom(
+                    {
+                        "expression": "steps['inner']?.status == 'Succeeded'"
+                        " ? steps['inner'].outputs.parameters['task-id']"
+                        " : 'SKIPPED'"
+                    }
+                ),
+            )
 
         # Forward additional outputs based on node type so that
         # downstream foreach/switch DAG tasks can reference them.
@@ -1346,7 +1367,7 @@ class ArgoWorkflows(object):
                     }
                 )
             )
-        if node.type == "foreach":
+        if node.type == "foreach" and not node.parallel_step:
             wrapper_outputs.extend(
                 [
                     Parameter("num-splits").valueFrom(
@@ -1365,7 +1386,7 @@ class ArgoWorkflows(object):
                     ),
                 ]
             )
-        if getattr(node, "parallel_foreach", False):
+        if node.parallel_step or getattr(node, "parallel_foreach", False):
             wrapper_outputs.extend(
                 [
                     Parameter("num-parallel").valueFrom(
@@ -1390,6 +1411,51 @@ class ArgoWorkflows(object):
             .steps([inner_step])
             .inputs(Inputs().parameters(wrapper_input_params))
             .outputs(Outputs().parameters(wrapper_outputs))
+        )
+
+    def _build_foreach_join_wrapper(
+        self, node, dag_task_parameters, should_run_parameter
+    ):
+        wrapper_input_params = [
+            Parameter(parameter.payload["name"]) for parameter in dag_task_parameters
+        ]
+        inner_params = [
+            Parameter(parameter.payload["name"]).value(
+                "{{inputs.parameters.%s}}" % parameter.payload["name"]
+            )
+            for parameter in dag_task_parameters
+            if parameter.payload["name"] != should_run_parameter
+        ]
+        inner_step = (
+            WorkflowStep()
+            .name("inner")
+            .template(self._sanitize("cond-%s" % node.name))
+            .arguments(Arguments().parameters(inner_params))
+            .when("{{inputs.parameters.%s}} == true" % should_run_parameter)
+        )
+        return (
+            Template(self._sanitize(node.name))
+            .steps([inner_step])
+            .inputs(Inputs().parameters(wrapper_input_params))
+            .outputs(
+                Outputs().parameters(
+                    [
+                        Parameter("task-id").valueFrom(
+                            {
+                                "expression": "steps['inner']?.status == 'Succeeded'"
+                                " ? steps['inner'].outputs.parameters['task-id']"
+                                " : 'SKIPPED'"
+                            }
+                        ),
+                        Parameter("should-run").valueFrom(
+                            {
+                                "expression": "steps['inner']?.status == 'Succeeded'"
+                                " ? 'true' : 'false'"
+                            }
+                        ),
+                    ]
+                )
+            )
         )
 
     # Visit every node and yield the uber DAGTemplate(s).
@@ -1448,7 +1514,7 @@ class ArgoWorkflows(object):
                     Parameter("split-index").value("{{inputs.parameters.split-index}}"),
                 ]
                 if self._is_conditional_node(node):
-                    self.wrapped_conditional_nodes.add(node.name)
+                    parameters.extend(self._conditional_control_parameters(node))
                     templates.append(self._build_conditional_wrapper(node, parameters))
                 dag_task = (
                     DAGTask(self._sanitize(node.name))
@@ -1530,6 +1596,10 @@ class ArgoWorkflows(object):
                         ]
                     )
 
+                if self._is_conditional_node(node):
+                    parameters.extend(self._conditional_control_parameters(node))
+                    templates.append(self._build_conditional_wrapper(node, parameters))
+
                 dag_task = (
                     DAGTask(self._sanitize(node.name))
                     .template(self._sanitize(node.name))
@@ -1538,10 +1608,7 @@ class ArgoWorkflows(object):
             else:
                 # Every other node needs only input-paths
                 has_wrapped_conditional_pred = any(
-                    self._is_conditional_node(self.graph[n])
-                    and self.graph[n].type not in ("foreach",)
-                    and not self._is_recursive_node(self.graph[n])
-                    for n in node.in_funcs
+                    self._is_conditional_node(self.graph[n]) for n in node.in_funcs
                 )
                 if has_wrapped_conditional_pred:
                     # Build input-paths as an Argo expression that only
@@ -1558,20 +1625,11 @@ class ArgoWorkflows(object):
                             "+ tasks['%s'].outputs.parameters['task-id']"
                             % (n, sanitized)
                         )
-                        if (
-                            self._is_conditional_node(pred)
-                            and pred.type not in ("foreach",)
-                            and not self._is_recursive_node(pred)
-                        ):
-                            if n in self.wrapped_conditional_nodes:
-                                ran_check = (
-                                    "tasks['%s'].outputs.parameters['should-run'] == 'true'"
-                                    % sanitized
-                                )
-                            else:
-                                ran_check = (
-                                    "tasks['%s']?.status == 'Succeeded'" % sanitized
-                                )
+                        if self._is_conditional_node(pred):
+                            ran_check = (
+                                "tasks['%s'].outputs.parameters['should-run'] == 'true'"
+                                % sanitized
+                            )
                             expr_parts.append(
                                 "(%s ? %s + ',' : '')" % (ran_check, path_expr)
                             )
@@ -1619,158 +1677,17 @@ class ArgoWorkflows(object):
                             ]
                         )
 
-                # Wrap conditional nodes in Steps templates so their
-                # task-id output is always resolvable (even when skipped).
-                is_wrapped_conditional = self._is_conditional_node(
-                    node
-                ) and not self._is_recursive_node(node)
+                # Wrap conditional nodes so inactive branches expose stable outputs.
+                is_wrapped_conditional = self._is_conditional_node(node)
                 if is_wrapped_conditional:
-                    for sf in node.in_funcs:
-                        if self.graph[sf].type == "split-switch":
-                            parameters.append(
-                                Parameter(
-                                    "switch-step-value-%s" % self._sanitize(sf)
-                                ).value(
-                                    "{{tasks.%s.outputs.parameters.switch-step}}"
-                                    % self._sanitize(sf)
-                                )
-                            )
-                    for cp in node.in_funcs:
-                        if self._is_conditional_node(self.graph[cp]) and self.graph[
-                            cp
-                        ].type not in ("foreach",):
-                            sanitized_cp = self._sanitize(cp)
-                            if cp in self.wrapped_conditional_nodes:
-                                param_value = (
-                                    "{{tasks.%s.outputs.parameters.should-run}}"
-                                    % sanitized_cp
-                                )
-                            else:
-                                param_value = (
-                                    "{{=tasks['%s']?.status == 'Succeeded'"
-                                    " ? 'true' : 'false'}}" % sanitized_cp
-                                )
-                            parameters.append(
-                                Parameter("should-run-%s" % sanitized_cp).value(
-                                    param_value
-                                )
-                            )
+                    parameters.extend(self._conditional_control_parameters(node))
 
-                conditional_deps = [
+                # Conditional graph nodes are public wrappers: an inactive node
+                # succeeds, an active successful node succeeds, and an active
+                # failed node does not. Every graph edge is therefore a barrier.
+                depends_str = " && ".join(
                     "%s.Succeeded" % self._sanitize(in_func)
                     for in_func in node.in_funcs
-                    if self._is_conditional_node(self.graph[in_func])
-                    or self.graph[in_func].type == "split-switch"
-                ]
-                required_deps = [
-                    "%s.Succeeded" % self._sanitize(in_func)
-                    for in_func in node.in_funcs
-                    if not self._is_conditional_node(self.graph[in_func])
-                    and self.graph[in_func].type != "split-switch"
-                ]
-                if self._is_conditional_skip_node(
-                    node
-                ) or self._many_in_funcs_all_conditional(node):
-                    # skip nodes need unique condition handling
-                    conditional_deps = [
-                        "%s.Succeeded" % self._sanitize(in_func)
-                        for in_func in node.in_funcs
-                    ]
-                    required_deps = []
-
-                # join steps in_funcs need special handling, as there can be disjoint sets of always-executing and conditional branches.
-                if node.type == "join" and any(
-                    self._is_conditional_node(self.graph[fn]) for fn in node.in_funcs
-                ):
-
-                    def _split_switch_ancestors(step_name, first_ancestor):
-                        acc = []
-                        for in_fn in self.graph[step_name].in_funcs:
-                            if self.graph[in_fn].type == "split-switch":
-                                acc.append(in_fn)
-                            if not in_fn == first_ancestor:
-                                acc.extend(
-                                    _split_switch_ancestors(in_fn, first_ancestor)
-                                )
-
-                        return acc
-
-                    node_groups = {}
-                    node_switch_ancestors = {}
-                    for fn in node.in_funcs:
-                        if self.graph[fn].split_branches:
-                            # This is the latest split in the DAG.
-                            last_split = self.graph[fn].split_branches[-1]
-                            switch_ancestors = _split_switch_ancestors(
-                                fn, node.split_parents[-1]
-                            )
-                            if switch_ancestors:
-                                node_switch_ancestors[fn] = switch_ancestors
-                            new_funcs = node_groups.get(last_split, [])
-                            new_funcs.append(fn)
-                            node_groups[last_split] = new_funcs
-
-                    def build_ancestor_tree(node_groups, switch_ancestors):
-                        result = {}
-                        for parent, children in node_groups.items():
-                            nodes = [
-                                n
-                                for g in children
-                                for n in (g if isinstance(g, list) else [g])
-                            ]
-
-                            # Group nodes by their ancestor set
-                            by_anc = defaultdict(list)
-                            for n in nodes:
-                                by_anc[frozenset(switch_ancestors.get(n, []))].append(n)
-
-                            # Sort from most specific (most ancestors) to least
-                            groups = sorted(
-                                by_anc.items(), key=lambda x: len(x[0]), reverse=True
-                            )
-
-                            # Greedily build chains: add to a chain if this key is a subset of its first (largest) key
-                            chains = []
-                            for key, grp in groups:
-                                for chain in chains:
-                                    if key <= chain[0][0]:
-                                        chain.append((key, grp))
-                                        break
-                                else:
-                                    chains.append([(key, grp)])
-
-                            result[parent] = [[g for _, g in chain] for chain in chains]
-                        return result
-
-                    if node_groups:
-                        conditional_deps = []
-                        required_deps = []
-
-                        for parent, chains in build_ancestor_tree(
-                            node_groups, node_switch_ancestors
-                        ).items():
-                            parts = []
-                            for chain in chains:
-                                groups = [
-                                    "({})".format(
-                                        " || ".join(
-                                            "%s.Succeeded" % self._sanitize(g)
-                                            for g in grp
-                                        )
-                                    )
-                                    for grp in chain
-                                ]
-                                parts.append("({})".format(" || ".join(groups)))
-                            required_deps.append("&&".join(parts))
-
-                both_conditions = required_deps and conditional_deps
-
-                depends_str = "{required}{_and}{conditional}".format(
-                    required=("(%s)" if both_conditions else "%s")
-                    % " && ".join(required_deps),
-                    _and=" && " if both_conditions else "",
-                    conditional=("(%s)" if both_conditions else "%s")
-                    % " || ".join(conditional_deps),
                 )
                 dag_task = (
                     DAGTask(self._sanitize(node.name))
@@ -1781,11 +1698,9 @@ class ArgoWorkflows(object):
 
                 if is_wrapped_conditional:
                     # Create a Steps wrapper template for this conditional
-                    # node. The wrapper always runs (no `when` on the DAG
-                    # task) and always produces a task-id output, preventing
-                    # Argo v3.7.11+ from requeuing downstream tasks that
-                    # reference potentially-skipped predecessors.
-                    self.wrapped_conditional_nodes.add(node.name)
+                    # node. The wrapper always runs after successful graph
+                    # dependencies and emits stable outputs when its inner
+                    # task succeeds or is inactive.
                     templates.append(self._build_conditional_wrapper(node, parameters))
                 else:
                     # Non-wrapped conditional/join nodes keep the original
@@ -1800,15 +1715,24 @@ class ArgoWorkflows(object):
                         or self._is_conditional_skip_node(node)
                         or self._is_conditional_join_node(node)
                     ) and switch_in_funcs:
-                        # It is possible that the some of the leading steps did not execute at all. In this case the switch-step output would be missing and needs to be accounted for.
-                        # Use safe navigation (?.) so the expression resolves to nil instead of causing requeuing on Argo v3.7.11+.
+                        # Some non-recursive leading steps may not have executed.
+                        # Use safe navigation for those predecessors so a missing
+                        # switch-step resolves to nil instead of causing requeuing
+                        # on Argo v3.7.11+.
                         conditional_when = "||".join(
                             [
-                                "({{=(tasks['%s']?.status == 'Succeeded' ? tasks['%s']?.outputs?.parameters['switch-step'] : nil) == '%s'}})"
-                                % (
-                                    self._sanitize(switch_in_func),
-                                    self._sanitize(switch_in_func),
-                                    node.name,
+                                (
+                                    "{{tasks.%s.outputs.parameters.switch-step}}==%s"
+                                    % (self._sanitize(switch_in_func), node.name)
+                                    if self._is_recursive_node(
+                                        self.graph[switch_in_func]
+                                    )
+                                    else "({{=(tasks['%s']?.status == 'Succeeded' ? tasks['%s']?.outputs?.parameters['switch-step'] : nil) == '%s'}})"
+                                    % (
+                                        self._sanitize(switch_in_func),
+                                        self._sanitize(switch_in_func),
+                                        node.name,
+                                    )
                                 )
                                 for switch_in_func in switch_in_funcs
                             ]
@@ -1872,8 +1796,20 @@ class ArgoWorkflows(object):
                     #   - 'example-step-internal' which uses the metaflow step executing template 'recursive-example-step'
                     #   - 'example-step-recursion' which calls the parent template 'example-step' if switch-step output from 'example-step-internal' matches the condition.
                     sanitized_name = self._sanitize(node.name)
+                    recursive_template_name = (
+                        self._sanitize("cond-%s" % node.name)
+                        if self._is_conditional_node(node)
+                        else sanitized_name
+                    )
+                    recursive_parameters = [
+                        Parameter(parameter.payload["name"])
+                        for parameter in parameters
+                        if not parameter.payload["name"].startswith(
+                            ("switch-step-value-", "should-run-")
+                        )
+                    ]
                     templates.append(
-                        Template(sanitized_name)
+                        Template(recursive_template_name)
                         .steps(
                             [
                                 WorkflowStep()
@@ -1886,8 +1822,6 @@ class ArgoWorkflows(object):
                                                 "{{inputs.parameters.input-paths}}"
                                             )
                                         ]
-                                        # Add the additional inputs required by specific node types.
-                                        # We do not need to cover joins or @parallel, as a split-switch step can not be either one of these.
                                         + (
                                             [
                                                 Parameter("split-index").value(
@@ -1905,7 +1839,7 @@ class ArgoWorkflows(object):
                             [
                                 WorkflowStep()
                                 .name("%s-recursion" % sanitized_name)
-                                .template(sanitized_name)
+                                .template(recursive_template_name)
                                 .when(
                                     "{{steps.%s-internal.outputs.parameters.switch-step}}==%s"
                                     % (sanitized_name, node.name)
@@ -1931,7 +1865,7 @@ class ArgoWorkflows(object):
                                 ),
                             ]
                         )
-                        .inputs(Inputs().parameters(parameters))
+                        .inputs(Inputs().parameters(recursive_parameters))
                         .outputs(
                             # NOTE: We try to read the output parameters from the recursive template call first (<step>-recursion), and the internal step second (<step>-internal).
                             # This guarantees that we always get the output parameters of the last recursive step that executed.
@@ -1939,14 +1873,20 @@ class ArgoWorkflows(object):
                                 [
                                     Parameter("task-id").valueFrom(
                                         {
-                                            "expression": "(steps['%s-recursion']?.outputs ?? steps['%s-internal']?.outputs).parameters['task-id']"
-                                            % (sanitized_name, sanitized_name)
+                                            "expression": "steps['{0}-recursion']?.status == 'Succeeded'"
+                                            " ? steps['{0}-recursion'].outputs.parameters['task-id']"
+                                            " : steps['{0}-internal'].outputs.parameters['task-id']".format(
+                                                sanitized_name
+                                            )
                                         }
                                     ),
                                     Parameter("switch-step").valueFrom(
                                         {
-                                            "expression": "(steps['%s-recursion']?.outputs ?? steps['%s-internal']?.outputs).parameters['switch-step']"
-                                            % (sanitized_name, sanitized_name)
+                                            "expression": "steps['{0}-recursion']?.status == 'Succeeded'"
+                                            " ? steps['{0}-recursion'].outputs.parameters['switch-step']"
+                                            " : steps['{0}-internal'].outputs.parameters['switch-step']".format(
+                                                sanitized_name
+                                            )
                                         }
                                     ),
                                 ]
@@ -2085,106 +2025,70 @@ class ArgoWorkflows(object):
                             )
                         )
                     )
-                    .outputs(
-                        Outputs().parameters(
-                            [
-                                # non @parallel tasks set task-ids as outputs
-                                Parameter("task-id").valueFrom(
-                                    {
-                                        "parameter": "{{tasks.%s.outputs.parameters.task-id}}"
-                                        % self._sanitize(
-                                            self.graph[node.matching_join].in_funcs[0]
-                                        )
-                                    }
-                                    if not self._is_conditional_join_node(
-                                        self.graph[node.matching_join]
-                                    )
-                                    else
-                                    # Note: If the nodes leading to the join are conditional, then we need to use an expression to pick the outputs from the task that executed.
-                                    # ref for operators: https://github.com/expr-lang/expr/blob/master/docs/language-definition.md
-                                    {
-                                        "expression": "get((%s)?.parameters, 'task-id')"
-                                        % " ?? ".join(
-                                            f"tasks['{self._sanitize(func)}']?.outputs"
-                                            for func in self.graph[
-                                                node.matching_join
-                                            ].in_funcs
-                                        )
-                                    }
-                                ),
-                            ]
-                            if not node.parallel_foreach
-                            else [
-                                # @parallel tasks set `task-id-entropy` and `num-parallel`
-                                # as outputs so task-ids can be derived in the join step.
-                                # Both of these values should be propagated from the
-                                # jobset labels.
-                                Parameter("num-parallel").valueFrom(
-                                    {
-                                        "parameter": "{{tasks.%s.outputs.parameters.num-parallel}}"
-                                        % self._sanitize(
-                                            self.graph[node.matching_join].in_funcs[0]
-                                        )
-                                    }
-                                ),
-                                Parameter("task-id-entropy").valueFrom(
-                                    {
-                                        "parameter": "{{tasks.%s.outputs.parameters.task-id-entropy}}"
-                                        % self._sanitize(
-                                            self.graph[node.matching_join].in_funcs[0]
-                                        )
-                                    }
-                                ),
-                            ]
-                        )
-                    )
                     .dag(DAGTemplate().fail_fast().tasks(dag_tasks_1))
                 )
 
-                join_foreach_task = (
-                    DAGTask(self._sanitize(self.graph[node.matching_join].name))
-                    .template(self._sanitize(self.graph[node.matching_join].name))
-                    .depends(f"{foreach_template_name}.Succeeded")
-                    .arguments(
-                        Arguments().parameters(
-                            (
-                                [
-                                    Parameter("input-paths").value(
-                                        "argo-{{workflow.name}}/%s/{{tasks.%s.outputs.parameters.task-id}}"
-                                        % (node.name, self._sanitize(node.name))
-                                    ),
-                                    Parameter("split-cardinality").value(
-                                        "{{tasks.%s.outputs.parameters.split-cardinality}}"
-                                        % self._sanitize(node.name)
-                                    ),
-                                ]
-                                if not node.parallel_foreach
-                                else [
-                                    Parameter("num-parallel").value(
-                                        "{{tasks.%s.outputs.parameters.num-parallel}}"
-                                        % self._sanitize(node.name)
-                                    ),
-                                    Parameter("task-id-entropy").value(
-                                        "{{tasks.%s.outputs.parameters.task-id-entropy}}"
-                                        % self._sanitize(node.name)
-                                    ),
-                                ]
-                            )
-                            + (
-                                [
-                                    Parameter("split-index").value(
-                                        # TODO : Pass down these parameters to the jobset stuff.
-                                        "{{inputs.parameters.split-index}}"
-                                    ),
-                                    Parameter("root-input-path").value(
-                                        "{{inputs.parameters.input-paths}}"
-                                    ),
-                                ]
-                                if parent_foreach
-                                else []
-                            )
+                join_node = self.graph[node.matching_join]
+                join_parameters = (
+                    [
+                        Parameter("input-paths").value(
+                            "argo-{{workflow.name}}/%s/{{tasks.%s.outputs.parameters.task-id}}"
+                            % (node.name, self._sanitize(node.name))
+                        ),
+                        Parameter("split-cardinality").value(
+                            "{{tasks.%s.outputs.parameters.split-cardinality}}"
+                            % self._sanitize(node.name)
+                        ),
+                    ]
+                    if not node.parallel_foreach
+                    else [
+                        Parameter("num-parallel").value(
+                            "{{tasks.%s.outputs.parameters.num-parallel}}"
+                            % self._sanitize(node.name)
+                        ),
+                        Parameter("task-id-entropy").value(
+                            "{{tasks.%s.outputs.parameters.task-id-entropy}}"
+                            % self._sanitize(node.name)
+                        ),
+                    ]
+                ) + (
+                    [
+                        Parameter("split-index").value(
+                            # TODO : Pass down these parameters to the jobset stuff.
+                            "{{inputs.parameters.split-index}}"
+                        ),
+                        Parameter("root-input-path").value(
+                            "{{inputs.parameters.input-paths}}"
+                        ),
+                    ]
+                    if parent_foreach
+                    else []
+                )
+                join_depends = f"{foreach_template_name}.Succeeded"
+                if self._is_conditional_node(join_node):
+                    should_run_parameter = "should-run-%s" % self._sanitize(node.name)
+                    join_parameters.append(
+                        Parameter(should_run_parameter).value(
+                            "{{tasks.%s.outputs.parameters.should-run}}"
+                            % self._sanitize(node.name)
                         )
                     )
+                    join_depends = "%s.Succeeded && (%s.Succeeded || %s.Skipped)" % (
+                        self._sanitize(node.name),
+                        foreach_template_name,
+                        foreach_template_name,
+                    )
+                    templates.append(
+                        self._build_foreach_join_wrapper(
+                            join_node, join_parameters, should_run_parameter
+                        )
+                    )
+
+                join_foreach_task = (
+                    DAGTask(self._sanitize(join_node.name))
+                    .template(self._sanitize(join_node.name))
+                    .depends(join_depends)
+                    .arguments(Arguments().parameters(join_parameters))
                 )
                 dag_tasks.append(join_foreach_task)
                 seen.append(self.graph[node.matching_join].name)
@@ -3033,7 +2937,11 @@ class ArgoWorkflows(object):
                 jobset.worker.environment_variable("TASK_ID_PREFIX", "worker")
 
                 yield (
-                    Template(ArgoWorkflows._sanitize(node.name))
+                    Template(
+                        self._sanitize("cond-%s" % node.name)
+                        if self._is_conditional_node(node)
+                        else self._sanitize(node.name)
+                    )
                     .resource(
                         "create",
                         jobset.dump(),
@@ -3064,7 +2972,7 @@ class ArgoWorkflows(object):
                     # The recursive template has the original step name,
                     # this becomes a template within the recursive ones 'steps'
                     template_name = self._sanitize("recursive-%s" % node.name)
-                elif node.name in self.wrapped_conditional_nodes:
+                elif self._is_conditional_node(node):
                     # Wrapped conditional nodes have a Steps template that
                     # takes the original name; the container template gets a
                     # "cond-" prefix so the wrapper can reference it.
