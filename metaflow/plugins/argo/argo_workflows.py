@@ -1245,6 +1245,13 @@ class ArgoWorkflows(object):
         return node.name in self.recursive_nodes
 
     def _conditional_control_parameters(self, node):
+        """Return parameters used to decide whether this step should run.
+
+        For each switch before this step, pass which branch it selected. For
+        each conditional step before this one, pass whether it ran or was
+        skipped. Foreach joins handle this separately because the foreach body
+        runs in a child DAG.
+        """
         parameters = []
         for in_func in node.in_funcs:
             predecessor = self.graph[in_func]
@@ -1271,16 +1278,17 @@ class ArgoWorkflows(object):
     def _build_conditional_wrapper(
         self, node, dag_task_parameters, when_parameter=None
     ):
-        """Build a Steps wrapper template for a conditional node.
+        """Create a wrapper around a step that may be skipped.
 
-        The wrapper produces stable outputs when the logical node succeeds or is
-        inactive. If selected execution fails, the wrapper fails and downstream
-        dependencies prevent consumers from resolving its missing outputs.
+        The wrapper runs after its dependencies succeed. It runs the real step
+        only when its branch was selected. If the branch was not selected, the
+        wrapper still succeeds and returns placeholder outputs that downstream
+        steps can safely reference. If the selected step fails, the wrapper
+        fails too.
 
-        `when_parameter` overrides the activity condition derived from
-        `node.in_funcs`. Foreach joins need this because their only graph
-        predecessor is inside the sub-DAG, so activity is carried by the foreach
-        split's `should-run` instead.
+        Foreach joins can pass `when_parameter` because the decision to run the
+        join comes from the foreach split rather than the steps inside its child
+        DAG.
         """
         sanitized = self._sanitize(node.name)
         inner_template = self._sanitize("cond-%s" % node.name)
@@ -1297,9 +1305,9 @@ class ArgoWorkflows(object):
             and self.graph[in_func].type != "foreach"
         ]
 
-        # Build wrapper input declarations and inner step arguments.
-        # The wrapper forwards all original parameters to the inner step,
-        # and keeps the conditional-control parameters for the when clause.
+        # The wrapper receives every parameter, but passes only normal step
+        # inputs to the real template. Branch-selection parameters are used only
+        # by the wrapper's `when` expression.
         wrapper_input_params = []
         inner_params = []
         for p in dag_task_parameters:
@@ -1576,11 +1584,9 @@ class ArgoWorkflows(object):
                     self._is_conditional_node(self.graph[n]) for n in node.in_funcs
                 )
                 if has_wrapped_conditional_pred:
-                    # Build input-paths as an Argo expression that only
-                    # includes paths from predecessors whose wrapper
-                    # reported should-run == 'true'. This avoids SKIPPED
-                    # task-ids in input-paths entirely, so the downstream
-                    # filter works regardless of metaflow version.
+                    # Include paths only from conditional inputs that actually
+                    # ran. A skipped wrapper returns a placeholder task ID, not
+                    # a real datastore path.
                     expr_parts = []
                     for n in node.in_funcs:
                         pred = self.graph[n]
@@ -1647,9 +1653,10 @@ class ArgoWorkflows(object):
                 if is_wrapped_conditional:
                     parameters.extend(self._conditional_control_parameters(node))
 
-                # Conditional graph nodes are public wrappers: an inactive node
-                # succeeds, an active successful node succeeds, and an active
-                # failed node does not. Every graph edge is therefore a barrier.
+                # Every conditional step is represented by a wrapper. The
+                # wrapper succeeds when its branch was skipped or its step
+                # completed, and fails when a selected step fails. Downstream
+                # tasks can therefore require every input wrapper to succeed.
                 depends_str = " && ".join(
                     "%s.Succeeded" % self._sanitize(in_func)
                     for in_func in node.in_funcs
@@ -1668,9 +1675,12 @@ class ArgoWorkflows(object):
                     # task succeeds or is inactive.
                     templates.append(self._build_conditional_wrapper(node, parameters))
                 else:
-                    # Mixed-predecessor joins need no `when`: `depends` already
-                    # requires every predecessor to succeed, making the old status
-                    # arm tautological. All-switch joins retain explicit selection.
+                    # `depends` decides when this join is eligible to run; `when`
+                    # decides whether it runs or is skipped. Because `depends`
+                    # already requires every input task to succeed, checking a
+                    # non-switch input's status again would always be true. Keep
+                    # `when` only when all inputs are switches and the selected
+                    # branch still matters.
                     switch_in_funcs = [
                         in_func
                         for in_func in node.in_funcs
@@ -1681,9 +1691,9 @@ class ArgoWorkflows(object):
                         and switch_in_funcs
                         and len(switch_in_funcs) == len(node.in_funcs)
                     ):
-                        # Preserve #3344's safe-navigation form for non-recursive
-                        # switches: a missing switch output resolves to nil instead
-                        # of causing Argo v3.7.11+ to requeue the task.
+                        # For a non-recursive switch, treat a missing output as no
+                        # branch match. Safe navigation resolves it to nil instead
+                        # of making Argo v3.7.11+ retry the unresolved expression.
                         dag_task.when(
                             "||".join(
                                 [
@@ -1741,11 +1751,18 @@ class ArgoWorkflows(object):
                     #   - 'example-step-internal' which uses the metaflow step executing template 'recursive-example-step'
                     #   - 'example-step-recursion' which calls the parent template 'example-step' if switch-step output from 'example-step-internal' matches the condition.
                     sanitized_name = self._sanitize(node.name)
+                    # A conditional recursive step uses its original template
+                    # name for the wrapper. Give the recursive driver a "cond-"
+                    # name so the wrapper can call it.
                     recursive_template_name = (
                         self._sanitize("cond-%s" % node.name)
                         if self._is_conditional_node(node)
                         else sanitized_name
                     )
+                    # Declare recursive template inputs using names only.
+                    # Copying caller values would leave `tasks.*` references that
+                    # do not exist inside the recursive template. Branch-selection
+                    # parameters are needed only by the outer wrapper.
                     recursive_parameters = [
                         Parameter(parameter.payload["name"])
                         for parameter in parameters
@@ -1812,8 +1829,11 @@ class ArgoWorkflows(object):
                         )
                         .inputs(Inputs().parameters(recursive_parameters))
                         .outputs(
-                            # NOTE: We try to read the output parameters from the recursive template call first (<step>-recursion), and the internal step second (<step>-internal).
-                            # This guarantees that we always get the output parameters of the last recursive step that executed.
+                            # If recursion continued, use the recursive call's
+                            # outputs. Otherwise use the current iteration's
+                            # outputs. Check the status explicitly because a
+                            # skipped recursive call may still have an outputs
+                            # object.
                             Outputs().parameters(
                                 [
                                     Parameter("task-id").valueFrom(
@@ -1953,9 +1973,9 @@ class ArgoWorkflows(object):
                 # (start [sets num-splits]) --> (task-a-foreach-(0,0) [dummy task]) --> (task-a) --> (join) --> (end)
                 # The (task-a-foreach-(0,0) [dummy task]) propagates the values of the `split-index` and the input paths.
                 # to the actual foreach task.
-                # This sub-DAG deliberately declares no outputs: an inactive
-                # conditional foreach expands to zero tasks, so output references
-                # would be unresolvable.
+                # Do not declare outputs for this child DAG. When the branch is
+                # not selected, the fanout creates no child tasks, so there is no
+                # task output to reference.
                 templates.append(
                     Template(foreach_template_name)
                     .inputs(
@@ -2021,6 +2041,9 @@ class ArgoWorkflows(object):
                             % self._sanitize(node.name)
                         )
                     )
+                    # When the fanout was not selected, Argo marks it Skipped.
+                    # That is valid only when the split wrapper succeeded. A
+                    # failure in the selected split must still stop the join.
                     join_depends = "%s.Succeeded && (%s.Succeeded || %s.Skipped)" % (
                         self._sanitize(node.name),
                         foreach_template_name,
@@ -2886,6 +2909,9 @@ class ArgoWorkflows(object):
                 jobset.control.environment_variable("TASK_ID_PREFIX", "control")
                 jobset.worker.environment_variable("TASK_ID_PREFIX", "worker")
 
+                # A conditional @parallel step uses its original template name
+                # for the wrapper. Give the underlying JobSet template a
+                # "cond-" name so the wrapper can call it.
                 yield (
                     Template(
                         self._sanitize("cond-%s" % node.name)
