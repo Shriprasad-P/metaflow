@@ -1268,12 +1268,19 @@ class ArgoWorkflows(object):
         # fall back to the graph's terminal step.
         return self.matching_conditional_join_dict.get(node.name, self.graph.end_step)
 
-    def _build_conditional_wrapper(self, node, dag_task_parameters):
+    def _build_conditional_wrapper(
+        self, node, dag_task_parameters, when_parameter=None
+    ):
         """Build a Steps wrapper template for a conditional node.
 
         The wrapper produces stable outputs when the logical node succeeds or is
         inactive. If selected execution fails, the wrapper fails and downstream
         dependencies prevent consumers from resolving its missing outputs.
+
+        `when_parameter` overrides the activity condition derived from
+        `node.in_funcs`. Foreach joins need this because their only graph
+        predecessor is inside the sub-DAG, so activity is carried by the foreach
+        split's `should-run` instead.
         """
         sanitized = self._sanitize(node.name)
         inner_template = self._sanitize("cond-%s" % node.name)
@@ -1324,7 +1331,10 @@ class ArgoWorkflows(object):
             when_parts.append(
                 "{{inputs.parameters.should-run-%s}} == true" % self._sanitize(cp)
             )
-        inner_when = " || ".join(when_parts) if when_parts else None
+        if when_parameter is not None:
+            inner_when = "{{inputs.parameters.%s}} == true" % when_parameter
+        else:
+            inner_when = " || ".join(when_parts) if when_parts else None
 
         inner_step = (
             WorkflowStep()
@@ -1411,51 +1421,6 @@ class ArgoWorkflows(object):
             .steps([inner_step])
             .inputs(Inputs().parameters(wrapper_input_params))
             .outputs(Outputs().parameters(wrapper_outputs))
-        )
-
-    def _build_foreach_join_wrapper(
-        self, node, dag_task_parameters, should_run_parameter
-    ):
-        wrapper_input_params = [
-            Parameter(parameter.payload["name"]) for parameter in dag_task_parameters
-        ]
-        inner_params = [
-            Parameter(parameter.payload["name"]).value(
-                "{{inputs.parameters.%s}}" % parameter.payload["name"]
-            )
-            for parameter in dag_task_parameters
-            if parameter.payload["name"] != should_run_parameter
-        ]
-        inner_step = (
-            WorkflowStep()
-            .name("inner")
-            .template(self._sanitize("cond-%s" % node.name))
-            .arguments(Arguments().parameters(inner_params))
-            .when("{{inputs.parameters.%s}} == true" % should_run_parameter)
-        )
-        return (
-            Template(self._sanitize(node.name))
-            .steps([inner_step])
-            .inputs(Inputs().parameters(wrapper_input_params))
-            .outputs(
-                Outputs().parameters(
-                    [
-                        Parameter("task-id").valueFrom(
-                            {
-                                "expression": "steps['inner']?.status == 'Succeeded'"
-                                " ? steps['inner'].outputs.parameters['task-id']"
-                                " : 'SKIPPED'"
-                            }
-                        ),
-                        Parameter("should-run").valueFrom(
-                            {
-                                "expression": "steps['inner']?.status == 'Succeeded'"
-                                " ? 'true' : 'false'"
-                            }
-                        ),
-                    ]
-                )
-            )
         )
 
     # Visit every node and yield the uber DAGTemplate(s).
@@ -1703,62 +1668,42 @@ class ArgoWorkflows(object):
                     # task succeeds or is inactive.
                     templates.append(self._build_conditional_wrapper(node, parameters))
                 else:
-                    # Non-wrapped conditional/join nodes keep the original
-                    # `when` clause on the DAG task.
+                    # Mixed-predecessor joins need no `when`: `depends` already
+                    # requires every predecessor to succeed, making the old status
+                    # arm tautological. All-switch joins retain explicit selection.
                     switch_in_funcs = [
                         in_func
                         for in_func in node.in_funcs
                         if self.graph[in_func].type == "split-switch"
                     ]
                     if (
-                        self._is_conditional_node(node)
-                        or self._is_conditional_skip_node(node)
-                        or self._is_conditional_join_node(node)
-                    ) and switch_in_funcs:
-                        # Some non-recursive leading steps may not have executed.
-                        # Use safe navigation for those predecessors so a missing
-                        # switch-step resolves to nil instead of causing requeuing
-                        # on Argo v3.7.11+.
-                        conditional_when = "||".join(
-                            [
-                                (
-                                    "{{tasks.%s.outputs.parameters.switch-step}}==%s"
-                                    % (self._sanitize(switch_in_func), node.name)
-                                    if self._is_recursive_node(
-                                        self.graph[switch_in_func]
-                                    )
-                                    else "({{=(tasks['%s']?.status == 'Succeeded' ? tasks['%s']?.outputs?.parameters['switch-step'] : nil) == '%s'}})"
-                                    % (
-                                        self._sanitize(switch_in_func),
-                                        self._sanitize(switch_in_func),
-                                        node.name,
-                                    )
-                                )
-                                for switch_in_func in switch_in_funcs
-                            ]
-                        )
-
-                        non_switch_in_funcs = [
-                            in_func
-                            for in_func in node.in_funcs
-                            if in_func not in switch_in_funcs
-                        ]
-                        status_when = ""
-                        if non_switch_in_funcs:
-                            status_when = "||".join(
+                        self._is_conditional_join_node(node)
+                        and switch_in_funcs
+                        and len(switch_in_funcs) == len(node.in_funcs)
+                    ):
+                        # Preserve #3344's safe-navigation form for non-recursive
+                        # switches: a missing switch output resolves to nil instead
+                        # of causing Argo v3.7.11+ to requeue the task.
+                        dag_task.when(
+                            "||".join(
                                 [
-                                    "{{tasks.%s.status}}==Succeeded"
-                                    % self._sanitize(in_func)
-                                    for in_func in non_switch_in_funcs
+                                    (
+                                        "{{tasks.%s.outputs.parameters.switch-step}}==%s"
+                                        % (self._sanitize(switch_in_func), node.name)
+                                        if self._is_recursive_node(
+                                            self.graph[switch_in_func]
+                                        )
+                                        else "({{=(tasks['%s']?.status == 'Succeeded' ? tasks['%s']?.outputs?.parameters['switch-step'] : nil) == '%s'}})"
+                                        % (
+                                            self._sanitize(switch_in_func),
+                                            self._sanitize(switch_in_func),
+                                            node.name,
+                                        )
+                                    )
+                                    for switch_in_func in switch_in_funcs
                                 ]
                             )
-
-                        total_when = (
-                            f"({status_when}) || ({conditional_when})"
-                            if status_when
-                            else conditional_when
                         )
-                        dag_task.when(total_when)
 
             dag_tasks.append(dag_task)
             # End the workflow if we have reached the end of the flow
@@ -2008,6 +1953,9 @@ class ArgoWorkflows(object):
                 # (start [sets num-splits]) --> (task-a-foreach-(0,0) [dummy task]) --> (task-a) --> (join) --> (end)
                 # The (task-a-foreach-(0,0) [dummy task]) propagates the values of the `split-index` and the input paths.
                 # to the actual foreach task.
+                # This sub-DAG deliberately declares no outputs: an inactive
+                # conditional foreach expands to zero tasks, so output references
+                # would be unresolvable.
                 templates.append(
                     Template(foreach_template_name)
                     .inputs(
@@ -2079,8 +2027,10 @@ class ArgoWorkflows(object):
                         foreach_template_name,
                     )
                     templates.append(
-                        self._build_foreach_join_wrapper(
-                            join_node, join_parameters, should_run_parameter
+                        self._build_conditional_wrapper(
+                            join_node,
+                            join_parameters,
+                            when_parameter=should_run_parameter,
                         )
                     )
 
