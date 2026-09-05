@@ -273,4 +273,6 @@ def test_generated_script_does_not_background_sudo_preflight(tmp_path):
     assert not lines[tilt_lines[0]].endswith("&")
     assert min(tunnel_bg) < tilt_lines[0]
     assert any(line == "wait" for line in lines)
-    assert any("kill 0" in line for line in lines)
+    assert any('trap "kill 0" EXIT' in line for line in lines)
+    assert not any("kill -0" in line for line in lines)
+    assert not any("_tunnel_pid" in line for line in lines)

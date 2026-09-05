@@ -189,11 +189,6 @@ generate-start-sh:
 	@echo '    exit 1' >> "$(DEVTOOLS_DIR)/start.sh"
 	@echo 'fi' >> "$(DEVTOOLS_DIR)/start.sh"
 	@echo 'PATH="$(MINIKUBE_DIR):$(TILT_DIR):$$PATH" $(MINIKUBE) tunnel &' >> $(DEVTOOLS_DIR)/start.sh
-	@echo '_tunnel_pid=$$!' >> "$(DEVTOOLS_DIR)/start.sh"
-	@echo 'if ! kill -0 $$_tunnel_pid 2>/dev/null; then' >> "$(DEVTOOLS_DIR)/start.sh"
-	@echo '    echo "❌ minikube tunnel failed to start."' >> "$(DEVTOOLS_DIR)/start.sh"
-	@echo '    exit 1' >> "$(DEVTOOLS_DIR)/start.sh"
-	@echo 'fi' >> "$(DEVTOOLS_DIR)/start.sh"
 	@echo 'echo -e "🚀 Starting Tilt with selected services..."' >> $(DEVTOOLS_DIR)/start.sh
 	@echo 'echo -e "\033[1;38;5;46m\n🔥 \033[1;38;5;196mNext Steps:\033[0;38;5;46m Use \033[3mmetaflow-dev shell\033[23m to switch to the development\n   environment'\''s shell and start executing your Metaflow flows.\n\033[0m"' >> "$(DEVTOOLS_DIR)/start.sh"
 	@echo 'PATH="$(HELM_DIR):$(MINIKUBE_DIR):$(TILT_DIR):$$PATH" SERVICES="$$SERVICES" tilt up -f $(TILTFILE)' >> $(DEVTOOLS_DIR)/start.sh
