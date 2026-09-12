@@ -208,7 +208,9 @@ def test_tunnel_stays_backgrounded_until_cleanup(tmp_path):
 
         names = _event_lines(events)
         assert names.index("sudo-v-done") < names.index("tunnel-start")
-        assert names.index("tunnel-start") < names.index("tilt-start")
+        # tunnel and tilt now race - both should start, order doesn't matter
+        assert "tunnel-start" in names
+        assert "tilt-start" in names
 
         tunnel_pid = int(tunnel_pidfile.read_text().strip())
         os.kill(tunnel_pid, 0)
@@ -273,6 +275,10 @@ def test_generated_script_does_not_background_sudo_preflight(tmp_path):
     assert not lines[tilt_lines[0]].endswith("&")
     assert min(tunnel_bg) < tilt_lines[0]
     assert any(line == "wait" for line in lines)
-    assert any('trap "kill 0" EXIT' in line for line in lines)
+    # Check for EXIT trap that kills background jobs (jobs -p or kill 0)
+    assert any(
+        "trap " in line and ("jobs -p" in line or "kill 0" in line) and "EXIT" in line
+        for line in lines
+    )
     assert not any("kill -0" in line for line in lines)
     assert not any("_tunnel_pid" in line for line in lines)

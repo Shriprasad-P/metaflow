@@ -172,7 +172,7 @@ generate-start-sh:
 	@echo '#!/bin/bash' > $(DEVTOOLS_DIR)/start.sh
 	@echo 'set -e' >> $(DEVTOOLS_DIR)/start.sh
 	@echo 'trap "exit" INT TERM' >> $(DEVTOOLS_DIR)/start.sh
-	@echo 'trap "kill 0" EXIT' >> $(DEVTOOLS_DIR)/start.sh
+	@echo 'trap '"'"'kill $$(jobs -p) 2>/dev/null || true'"'"' EXIT' >> $(DEVTOOLS_DIR)/start.sh
 	@echo 'eval $$($(MINIKUBE) docker-env --shell bash)' >> $(DEVTOOLS_DIR)/start.sh
 	@echo 'if [ -n "$$SERVICES_OVERRIDE" ]; then' >> "$(DEVTOOLS_DIR)/start.sh"
 	@echo '    echo "🌐 Using user-provided list of services: $$SERVICES_OVERRIDE"' >> "$(DEVTOOLS_DIR)/start.sh"
