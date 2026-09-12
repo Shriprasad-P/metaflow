@@ -580,11 +580,11 @@ class CardComponentCollector:
     def _resolve_card_ids(self, all_card_meta, editable_cards_meta):
         """
         Resolve card IDs and populate self._card_id_map.
-        
+
         When duplicate IDs exist:
         - If exactly one colliding card is editable, resolve the ID to that card
         - Otherwise, remove the ID from the map and warn
-        
+
         This fixes issue #3347 where duplicate IDs between editable and non-editable
         cards caused IndexError or silent content loss.
         """
@@ -596,7 +596,7 @@ class CardComponentCollector:
                 if card_id not in cards_by_id:
                     cards_by_id[card_id] = []
                 cards_by_id[card_id].append(card_meta)
-        
+
         # Resolve each ID
         for card_id, cards_with_id in cards_by_id.items():
             if len(cards_with_id) == 1:

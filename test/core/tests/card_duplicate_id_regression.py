@@ -3,9 +3,9 @@ from metaflow_test import MetaflowTest, ExpectationFailed, steps, tag
 
 class CardDuplicateIdRegressionTest(MetaflowTest):
     """
-    Regression test for issue #3347: Stacked @card with duplicate id from 
+    Regression test for issue #3347: Stacked @card with duplicate id from
     a non-editable card should not raise IndexError or silently discard content.
-    
+
     Test scenarios:
     1. Non-editable card with id="mycard" + editable card with id="mycard"
        -> Should resolve to the editable card

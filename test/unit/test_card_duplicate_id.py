@@ -37,7 +37,9 @@ def collector(logger, card_creator):
     return CardComponentCollector(logger=logger, card_creator=card_creator)
 
 
-def test_duplicate_id_with_non_editable_card_no_longer_raises_index_error(collector, logger):
+def test_duplicate_id_with_non_editable_card_no_longer_raises_index_error(
+    collector, logger
+):
     """
     Test case 1 from issue #3347:
     When duplicate ids exist across editable and non-editable cards,
@@ -47,7 +49,7 @@ def test_duplicate_id_with_non_editable_card_no_longer_raises_index_error(collec
         @card(type="default_json", id="mycard")  # non-editable
         @card(type="blank")                      # editable, no id
         @card(type="blank", id="mycard")         # editable, duplicate id
-        
+
     Expected: Since only ONE editable card has id="mycard", it should win.
     """
     # Add three cards: one non-editable with id, one editable without id, one editable with duplicate id
@@ -87,11 +89,11 @@ def test_duplicate_id_with_non_editable_card_no_longer_raises_index_error(collec
 
     # After the fix, this should not raise IndexError
     collector._finalize()
-    
+
     # Since only one editable card has "mycard", it should win
     assert "mycard" in collector._card_id_map
     assert collector._card_id_map["mycard"] == editable_card_with_id["uuid"]
-    
+
     # The editable card should be accessible
     card_meta = collector._cards_meta[collector._card_id_map["mycard"]]
     assert card_meta["editable"] is True
@@ -221,7 +223,7 @@ def test_multiple_editable_cards_with_same_id_drops_id(collector, logger):
 
     # Multiple editable cards with same ID: should be dropped
     assert "mycard" not in collector._card_id_map
-    
+
     # A warning should have been logged
     assert any("duplicate id" in msg.lower() for msg in logger.messages)
 
