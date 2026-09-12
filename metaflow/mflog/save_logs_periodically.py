@@ -5,6 +5,7 @@ import subprocess
 from threading import Thread
 
 from metaflow.sidecar import MessageTypes
+from metaflow.tracing import traced
 from metaflow.util import to_unicode
 from . import update_delay, BASH_SAVE_LOGS_ARGS, TASK_LOG_SOURCE
 from .mflog import decorate
@@ -109,8 +110,31 @@ class SaveLogsPeriodicallySidecar(object):
                             "current_size=%d delta=%d elapsed_seconds=%.3f"
                             % (path, previous, current, current - previous, elapsed),
                         )
+                
+                upload_start_time = time.time()
+                returncode = None
+                exception = None
                 try:
-                    self._call_save_logs()
-                except:
+                    returncode = self._call_save_logs()
+                except Exception as e:
+                    exception = e
+                
+                upload_elapsed = time.time() - upload_start_time
+                total_bytes = sum(new_sizes)
+                attrs = {
+                    "elapsed_seconds": "%.3f" % upload_elapsed,
+                    "total_bytes": str(total_bytes),
+                    "files_changed": str(len([s for s, ps in zip(new_sizes, previous_sizes) if s != ps])),
+                }
+                if returncode is not None:
+                    attrs["returncode"] = str(returncode)
+                    attrs["success"] = str(returncode == 0)
+                if exception is not None:
+                    attrs["exception"] = str(type(exception).__name__)
+                
+                with traced("save_logs_periodically.upload", attrs=attrs):
+                    pass
+                
+                if exception is not None:
                     pass
             time.sleep(update_delay(time.time() - start_time))
