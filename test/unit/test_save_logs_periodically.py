@@ -271,3 +271,66 @@ def test_call_save_logs_confirms_absence_of_logs_when_child_crashes(
     assert returncode == -9
     assert _read_uploader_messages(uploader_log) == []
     process.communicate.assert_called_once_with()
+
+
+def test_tracing_does_not_interfere_when_disabled(monkeypatch, mocker, tmp_path):
+    """Verify tracing is opt-in and doesn't affect normal upload when tracing is disabled."""
+    stdout = tmp_path / "stdout"
+    stderr = tmp_path / "stderr"
+    stdout.write_bytes(b"out\n")
+    stderr.write_bytes(b"err\n")
+    monkeypatch.setenv("MFLOG_STDOUT", str(stdout))
+    monkeypatch.setenv("MFLOG_STDERR", str(stderr))
+    monkeypatch.setenv("DISABLE_TRACING", "1")
+    sidecar = _new_sidecar(False)
+    sidecar.is_alive = True
+    mocker.patch(
+        "metaflow.mflog.save_logs_periodically.time.sleep",
+        side_effect=lambda _: setattr(sidecar, "is_alive", False),
+    )
+    mocker.patch("metaflow.mflog.save_logs_periodically.time.time", return_value=100)
+    call_mock = mocker.patch(
+        "metaflow.mflog.save_logs_periodically.subprocess.call",
+        return_value=0,
+    )
+
+    sidecar._update_loop()
+
+    call_mock.assert_called_once()
+
+
+def test_tracing_records_upload_attributes_when_enabled(monkeypatch, mocker, tmp_path):
+    """Verify tracing captures upload attributes when tracing is enabled."""
+    stdout = tmp_path / "stdout"
+    stderr = tmp_path / "stderr"
+    stdout.write_bytes(b"out\n")
+    stderr.write_bytes(b"err\n")
+    monkeypatch.setenv("MFLOG_STDOUT", str(stdout))
+    monkeypatch.setenv("MFLOG_STDERR", str(stderr))
+    monkeypatch.delenv("DISABLE_TRACING", raising=False)
+    monkeypatch.setenv("OTEL_ENDPOINT", "http://localhost:4318")
+    sidecar = _new_sidecar(False)
+    sidecar.is_alive = True
+    mocker.patch(
+        "metaflow.mflog.save_logs_periodically.time.sleep",
+        side_effect=lambda _: setattr(sidecar, "is_alive", False),
+    )
+    mocker.patch("metaflow.mflog.save_logs_periodically.time.time", return_value=100)
+    call_mock = mocker.patch(
+        "metaflow.mflog.save_logs_periodically.subprocess.call",
+        return_value=0,
+    )
+    traced_mock = mocker.patch("metaflow.mflog.save_logs_periodically.traced")
+
+    sidecar._update_loop()
+
+    call_mock.assert_called_once()
+    traced_mock.assert_called_once()
+    call_args = traced_mock.call_args
+    assert call_args[0][0] == "save_logs_periodically.upload"
+    attrs = call_args[1]["attrs"]
+    assert "elapsed_seconds" in attrs
+    assert "total_bytes" in attrs
+    assert "files_changed" in attrs
+    assert "returncode" in attrs
+    assert "success" in attrs
