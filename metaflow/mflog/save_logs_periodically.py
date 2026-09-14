@@ -110,31 +110,34 @@ class SaveLogsPeriodicallySidecar(object):
                             "current_size=%d delta=%d elapsed_seconds=%.3f"
                             % (path, previous, current, current - previous, elapsed),
                         )
-                
+
                 upload_start_time = time.time()
                 returncode = None
                 exception = None
-                try:
-                    returncode = self._call_save_logs()
-                except Exception as e:
-                    exception = e
-                
-                upload_elapsed = time.time() - upload_start_time
-                total_bytes = sum(new_sizes)
                 attrs = {
-                    "elapsed_seconds": "%.3f" % upload_elapsed,
-                    "total_bytes": str(total_bytes),
-                    "files_changed": str(len([s for s, ps in zip(new_sizes, previous_sizes) if s != ps])),
+                    "total_bytes": str(sum(new_sizes)),
+                    "files_changed": str(
+                        len([s for s, ps in zip(new_sizes, previous_sizes) if s != ps])
+                    ),
                 }
-                if returncode is not None:
-                    attrs["returncode"] = str(returncode)
-                    attrs["success"] = str(returncode == 0)
-                if exception is not None:
-                    attrs["exception"] = str(type(exception).__name__)
-                
-                with traced("save_logs_periodically.upload", attrs=attrs):
-                    pass
-                
-                if exception is not None:
-                    pass
+                with traced("save_logs_periodically.upload", attrs=attrs) as span:
+                    try:
+                        returncode = self._call_save_logs()
+                    except BaseException as e:
+                        # Upload failures are intentionally non-fatal to the
+                        # sidecar, as they were before tracing was added.
+                        exception = e
+
+                    attrs["elapsed_seconds"] = "%.3f" % (
+                        time.time() - upload_start_time
+                    )
+                    if returncode is not None:
+                        attrs["returncode"] = str(returncode)
+                        attrs["success"] = str(returncode == 0)
+                    if exception is not None:
+                        attrs["exception"] = str(type(exception).__name__)
+
+                    if span is not None:
+                        for key, value in attrs.items():
+                            span.set_attribute(key, value)
             time.sleep(update_delay(time.time() - start_time))
